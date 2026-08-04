@@ -43,7 +43,10 @@ function readJson(file) {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (error) {
     if (error.code === 'ENOENT') return null;
-    throw new Error(`cannot parse ${file}: ${error.message}`);
+    // Cache stores can contain arbitrary JSON-like project files. A malformed
+    // unrelated file must not make the package scan incomplete.
+    if (error instanceof SyntaxError) return null;
+    throw new Error(`cannot read ${file}: ${error.message}`);
   }
 }
 

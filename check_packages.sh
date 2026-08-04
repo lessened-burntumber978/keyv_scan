@@ -105,7 +105,12 @@ fi
 
 if command -v pnpm >/dev/null 2>&1; then
 	manager_count=$((manager_count + 1))
-	scan_command_path "pnpm global dependencies" pnpm-global installed node-modules pnpm root --global
+	# pnpm can be installed without a configured global package directory.
+	# That is a normal skip, not an incomplete scan.
+	pnpm_global_root=$(pnpm root --global 2>/dev/null || true)
+	if [[ -n "$pnpm_global_root" && -d "$pnpm_global_root" ]]; then
+		scan_path pnpm-global installed node-modules "$pnpm_global_root"
+	fi
 	scan_command_path "pnpm store" pnpm-store cached pnpm-store pnpm store path
 fi
 
