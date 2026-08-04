@@ -5,9 +5,15 @@ set -u
 SCRIPT_DIR=$(dirname -- "$0")
 SCRIPT_DIR=$(cd -- "$SCRIPT_DIR" && pwd -P)
 CSV_FILE=${1:-"$SCRIPT_DIR/packages.csv"}
+INVENTORY_SCRIPT="$SCRIPT_DIR/package_inventory.js"
 
 if [[ ! -r "$CSV_FILE" ]]; then
 	printf 'Error: cannot read package list: %s\n' "$CSV_FILE" >&2
+	exit 2
+fi
+
+if [[ ! -r "$INVENTORY_SCRIPT" ]]; then
+	printf 'Error: cannot read inventory helper: %s\n' "$INVENTORY_SCRIPT" >&2
 	exit 2
 fi
 
@@ -16,208 +22,145 @@ if ! command -v node >/dev/null 2>&1; then
 	exit 2
 fi
 
-declare -A AFFECTED
-declare -A REPORTED
+TEMP_DIR=$(mktemp -d) || {
+	printf 'Error: could not create a temporary directory.\n' >&2
+	exit 2
+}
+trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
 
-# Read package names and turn the version alternatives into exact lookups.
-while IFS=, read -r package versions; do
-	[[ "$package" == "Package" || -z "$package" ]] && continue
+FINDINGS_FILE="$TEMP_DIR/findings.tsv"
+: >"$FINDINGS_FILE"
+scan_failures=0
+manager_count=0
 
-	while [[ "$versions" == *'=='* ]]; do
-		version=${versions#*==}
-		if [[ "$version" == *'||'* ]]; then
-			version=${version%%'||'*}
-			versions=${versions#*'||'}
-		else
-			versions=
-		fi
-		version=${version//[[:space:]]/}
-		[[ -n "$version" ]] && AFFECTED["$package|$version"]=1
-	done
-done <"$CSV_FILE"
-
-matches=0
-
-report() {
-	local location=$1 package=$2 version=$3
-	local key="$location|$package|$version"
-	[[ ${REPORTED[$key]+yes} ]] && return
-	REPORTED[$key]=1
-	printf 'FOUND  %-8s %s@%s\n' "$location" "$package" "$version"
-	matches=$((matches + 1))
+warn_scan_failed() {
+	printf 'Warning: %s could not be checked; results are incomplete.\n' "$1" >&2
+	scan_failures=$((scan_failures + 1))
 }
 
-scan_npm_tree() {
-	local location=$1 global_flag=$2 prefix=$3 json_file
-	json_file=$(mktemp)
+scan_path() {
+	local source=$1 kind=$2 mode=$3 path=$4 output_file
+	output_file="$TEMP_DIR/output.tsv"
 
-	# npm ls returns non-zero when dependencies are missing or invalid; its
-	# JSON output is still useful for this scan.
-	if [[ "$global_flag" == "global" ]]; then
-		npm ls --global --all --json --prefix "$prefix" >"$json_file" 2>/dev/null || true
-	else
-		npm ls --all --json --prefix "$prefix" >"$json_file" 2>/dev/null || true
+	if ! node "$INVENTORY_SCRIPT" "$CSV_FILE" "$mode" "$path" >"$output_file"; then
+		warn_scan_failed "$source"
+		return
 	fi
 
 	while IFS=$'\t' read -r package version; do
 		[[ -n "$package" && -n "$version" ]] || continue
-		[[ ${AFFECTED["$package|$version"]+yes} ]] && report "$location" "$package" "$version"
-	done < <(
-		node - "$json_file" <<'NODE'
-const fs = require('fs');
-const file = process.argv[2];
-let root;
-try {
-  root = JSON.parse(fs.readFileSync(file, 'utf8'));
-} catch {
-  process.exit(0);
+		printf '%s\t%s\t%s\t%s\n' "$kind" "$source" "$package" "$version" >>"$FINDINGS_FILE"
+	done <"$output_file"
 }
 
-const seen = new Set();
-function walk(node, fallbackName) {
-  if (!node || typeof node !== 'object') return;
-  const name = node.name || fallbackName;
-  if (name && node.version) {
-    const key = `${name}|${node.version}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      process.stdout.write(`${name}\t${node.version}\n`);
-    }
-  }
-  for (const [dependencyName, dependency] of Object.entries(node.dependencies || {})) {
-    walk(dependency, dependencyName);
-  }
-}
-walk(root, root.name);
-NODE
-	)
-	rm -f "$json_file"
+capture_command() {
+	local description=$1 output_file=$2
+	shift 2
+	if ! "$@" >"$output_file" 2>/dev/null; then
+		warn_scan_failed "$description"
+		return 1
+	fi
 }
 
-scan_cache() {
-	local package version cache_listing key key_file
-	cache_listing=$(npm cache ls 2>/dev/null || true)
-	key_file=$(mktemp)
-	for key in "${!AFFECTED[@]}"; do
-		printf '%s\n' "$key"
-	done >"$key_file"
+scan_command_path() {
+	local description=$1 source=$2 kind=$3 mode=$4
+	shift 4
+	local path_file="$TEMP_DIR/path.txt" path
 
-	while IFS='|' read -r package version; do
-		report cache "$package" "$version"
-	done < <(awk -F'|' '
-        NR == FNR { package[NR] = $1; version[NR] = $2; count = NR; next }
-        {
-            for (i = 1; i <= count; i++) {
-                if (index($0, package[i]) && index($0, "-" version[i] ".tgz")) {
-                    print package[i] "|" version[i]
-                }
-            }
-        }
-    ' "$key_file" <(printf '%s\n' "$cache_listing") | sort -u)
-	rm -f "$key_file"
-}
-
-scan_pnpm_tree() {
-	local location=$1 global_flag=$2 json_file
-	json_file=$(mktemp)
-
-	if [[ "$global_flag" == "global" ]]; then
-		pnpm list --global --depth Infinity --json >"$json_file" 2>/dev/null || true
-	else
-		pnpm list --depth Infinity --json >"$json_file" 2>/dev/null || true
+	if ! capture_command "$description" "$path_file" "$@"; then
+		return
 	fi
 
-	while IFS=$'\t' read -r package version; do
-		[[ -n "$package" && -n "$version" ]] || continue
-		[[ ${AFFECTED["$package|$version"]+yes} ]] && report "$location" "$package" "$version"
-	done < <(
-		node - "$json_file" <<'NODE'
-const fs = require('fs');
-let data;
-try {
-  data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-} catch {
-  process.exit(0);
-}
+	path=$(node -e '
+const fs = require("fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/);
+const value = lines.at(-1) || "";
+try { process.stdout.write(JSON.parse(value)); }
+catch { process.stdout.write(value); }
+' "$path_file")
 
-const seen = new Set();
-function walk(node) {
-  if (!node || typeof node !== 'object') return;
-  for (const [name, dependency] of Object.entries(node.dependencies || {})) {
-    if (dependency.version) {
-      const key = `${name}|${dependency.version}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        process.stdout.write(`${name}\t${dependency.version}\n`);
-      }
-    }
-    walk(dependency);
-  }
-}
-for (const root of (Array.isArray(data) ? data : [data])) walk(root);
-NODE
-	)
-	rm -f "$json_file"
-}
+	if [[ -z "$path" ]]; then
+		warn_scan_failed "$description"
+		return
+	fi
 
-scan_yarn_cache() {
-	local cache_dir package version safe_package entry key
-	cache_dir=$(yarn cache dir 2>/dev/null || true)
-	[[ -d "$cache_dir" ]] || return
-
-	while IFS= read -r -d '' entry; do
-		for key in "${!AFFECTED[@]}"; do
-			IFS='|' read -r package version <<< "$key"
-			safe_package=${package//\//-}
-			if [[ "$entry" == *"$safe_package"* && "$entry" == *"$version"* ]]; then
-				report yarn-cache "$package" "$version"
-			fi
-		done
-	done < <(find "$cache_dir" -type f -print0 2>/dev/null)
-}
-
-scan_pnpm_store() {
-	local store_dir package version key metadata
-	store_dir=$(pnpm store path 2>/dev/null || true)
-	[[ -d "$store_dir" ]] || return
-
-	while IFS= read -r -d '' metadata; do
-		for key in "${!AFFECTED[@]}"; do
-			IFS='|' read -r package version <<< "$key"
-			if grep -Fq '"name":"'"$package"'"' "$metadata" 2>/dev/null \
-				&& grep -Fq '"version":"'"$version"'"' "$metadata" 2>/dev/null; then
-				report pnpm-store "$package" "$version"
-			fi
-		done
-	done < <(find "$store_dir" -type f -name '*.json' -print0 2>/dev/null)
+	scan_path "$source" "$kind" "$mode" "$path"
 }
 
 printf 'Checking affected npm packages from %s\n' "$CSV_FILE"
+
+# This catches npm, pnpm, and node_modules-based Yarn installations without
+# relying on a package manager's dependency-tree output.
+scan_path project installed node-modules "$PWD/node_modules"
+scan_path yarn-unplugged installed package-tree "$PWD/.yarn/unplugged"
+
 if command -v npm >/dev/null 2>&1; then
-	scan_npm_tree project local "$PWD"
+	manager_count=$((manager_count + 1))
+	scan_command_path "npm global dependencies" npm-global installed node-modules npm root --global
 
-	global_prefix=$(npm prefix --global 2>/dev/null || true)
-	if [[ -n "$global_prefix" ]]; then
-		scan_npm_tree global global "$global_prefix"
+	if capture_command "npm cache" "$TEMP_DIR/npm-cache.txt" npm cache ls; then
+		scan_path npm-cache cached npm-cache "$TEMP_DIR/npm-cache.txt"
 	fi
-
-	scan_cache
 fi
 
 if command -v pnpm >/dev/null 2>&1; then
-	scan_pnpm_tree pnpm-project local
-	scan_pnpm_tree pnpm-global global
-	scan_pnpm_store
+	manager_count=$((manager_count + 1))
+	scan_command_path "pnpm global dependencies" pnpm-global installed node-modules pnpm root --global
+	scan_command_path "pnpm store" pnpm-store cached pnpm-store pnpm store path
 fi
 
 if command -v yarn >/dev/null 2>&1; then
-	scan_yarn_cache
+	manager_count=$((manager_count + 1))
+	if capture_command "Yarn version" "$TEMP_DIR/yarn-version.txt" yarn --version; then
+		yarn_version=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").trim())' "$TEMP_DIR/yarn-version.txt")
+		yarn_major=${yarn_version%%.*}
+		if [[ "$yarn_major" == "1" ]]; then
+			scan_command_path "Yarn global dependencies" yarn-global installed package-tree yarn global dir --silent
+			scan_command_path "Yarn cache" yarn-cache cached yarn-cache yarn cache dir --silent
+		else
+			scan_command_path "Yarn cache" yarn-cache cached yarn-cache yarn config get cacheFolder
+		fi
+	fi
+
+	# Yarn Berry normally keeps cached archives inside the project. Scanning
+	# this path is harmless when it does not exist.
+	scan_path yarn-project-cache cached yarn-cache "$PWD/.yarn/cache"
 fi
 
-if ((matches == 0)); then
-	printf 'No affected packages found.\n'
-	exit 0
+if ((manager_count == 0)); then
+	warn_scan_failed "npm, pnpm, and Yarn package-manager stores"
 fi
 
-printf '%d affected package installation/cache entr%s found.\n' "$matches" "$([[ $matches -eq 1 ]] && printf y || printf ies)"
-exit 1
+sort -u "$FINDINGS_FILE" >"$TEMP_DIR/unique-findings.tsv"
+matches=0
+installed_matches=0
+cached_matches=0
+
+while IFS=$'\t' read -r kind source package version; do
+	[[ -n "$kind" ]] || continue
+	printf 'FOUND  %-9s %-18s %s@%s\n' "$kind" "$source" "$package" "$version"
+	matches=$((matches + 1))
+	if [[ "$kind" == "installed" ]]; then
+		installed_matches=$((installed_matches + 1))
+	else
+		cached_matches=$((cached_matches + 1))
+	fi
+done <"$TEMP_DIR/unique-findings.tsv"
+
+if ((matches > 0)); then
+	printf '%d installed and %d cached affected package entr%s found.\n' \
+		"$installed_matches" "$cached_matches" "$([[ $matches -eq 1 ]] && printf y || printf ies)"
+fi
+
+if ((scan_failures > 0)); then
+	printf 'Scan incomplete: %d check%s failed.\n' \
+		"$scan_failures" "$([[ $scan_failures -eq 1 ]] || printf s)" >&2
+	exit 2
+fi
+
+if ((matches > 0)); then
+	exit 1
+fi
+
+printf 'No affected packages found.\n'
+exit 0

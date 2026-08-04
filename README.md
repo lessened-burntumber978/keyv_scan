@@ -9,6 +9,20 @@ The list is based on Socket's ongoing incident report:
 
 <https://socket.dev/blog/popular-npm-packages-in-the-keyv-and-cacheable-namespaces-compromised-in-active-supply-chain>
 
+## Quick Start
+
+1. Clone or download this repository.
+2. Change into the JavaScript project you want to inspect.
+3. Run the scanner using its path:
+
+```bash
+/path/to/keyv_scan/check_packages.sh
+```
+
+The script uses the repository's `packages.csv` by default. A clean scan ends
+with `No affected packages found.` and exit code `0`. A matching package exits
+with code `1`; an incomplete scan exits with code `2`.
+
 ## Run the scan
 
 Requirements:
@@ -16,6 +30,8 @@ Requirements:
 - Bash
 - Node.js
 - Any package manager you want to check: npm, pnpm, or Yarn
+
+The script uses Bash features available in Bash 3.2 and later.
 
 From this directory, run:
 
@@ -35,21 +51,26 @@ The script does not install, update, or remove packages.
 
 The scanner checks exact package name and version pairs from `packages.csv`.
 
-- npm dependencies in the current directory
+- Packages installed under `node_modules` in the current directory, including
+  transitive and pnpm virtual-store packages
 - Globally installed npm dependencies
 - The npm cache
-- pnpm dependencies in the current directory
+- Packages in the current `.yarn/unplugged` directory
 - Globally installed pnpm dependencies
 - The pnpm content-addressable store
-- The Yarn cache
+- Globally installed Yarn Classic dependencies
+- Yarn Classic's cache
+- Yarn Berry's configured cache directory
+- The current project's `.yarn/cache` directory
 
 The current project is determined by the directory from which the script is
 run. Run it from each project directory that needs checking. The script does
-not search the entire filesystem or inspect every lockfile directly.
+not search the entire filesystem or inspect lockfiles directly.
 
 Package-manager checks are optional. If npm, pnpm, or Yarn is not installed,
 that manager's checks are skipped. Node.js is required because the script uses
-it to parse dependency-tree JSON output.
+it to read package metadata and cache indexes. Missing or failed checks are
+reported as incomplete rather than as a clean result.
 
 ## Results and exit codes
 
@@ -63,16 +84,19 @@ No affected packages found.
 Findings identify the source where a matching version was found:
 
 ```text
-FOUND  project  keyv@6.0.0
-FOUND  cache    cacheable@2.5.1
-FOUND  pnpm-store @cacheable/net@2.1.1
+FOUND  installed project            keyv@6.0.0
+FOUND  cached    pnpm-store         @cacheable/net@2.1.1
 ```
+
+`installed` means package metadata was found in an installed dependency tree.
+`cached` means an affected artifact remains in a package-manager cache or
+store; it does not prove that its install lifecycle scripts executed.
 
 Exit codes:
 
 - `0`: no affected package was found
 - `1`: one or more affected packages were found
-- `2`: the scan could not start, for example because the CSV or Node.js is missing
+- `2`: the scan could not start, or one or more checks failed and the result is incomplete
 
 ## Incident summary
 
@@ -115,6 +139,7 @@ malware-removal or full forensic investigation tool.
 ## Files
 
 - [`check_packages.sh`](check_packages.sh): Bash scanner
+- [`package_inventory.js`](package_inventory.js): exact package metadata and cache scanner
 - [`packages.csv`](packages.csv): package names and affected exact versions
 
 ## Source
