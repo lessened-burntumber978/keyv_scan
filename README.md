@@ -4,8 +4,13 @@ This repository contains a Bash script for checking whether affected versions
 from the `keyv` and `cacheable` npm supply-chain compromise are present in a
 local JavaScript development environment.
 
-The package and version list is maintained in [`packages.csv`](packages.csv).
-The list is based on Socket's ongoing incident report:
+The package and version list in [`packages.csv`](packages.csv) is a local copy
+of Wiz Research's published IOC list:
+
+<https://github.com/wiz-sec-public/wiz-research-iocs/blob/main/reports%2Fkeyv-packages.csv>
+
+Incident background and technical analysis are documented in Socket's ongoing
+incident report:
 
 <https://socket.dev/blog/popular-npm-packages-in-the-keyv-and-cacheable-namespaces-compromised-in-active-supply-chain>
 
@@ -115,9 +120,9 @@ The affected packages can be indirect dependencies. A project may therefore
 contain a vulnerable package even when it was never listed as a direct
 dependency.
 
-The incident was active when Socket published its report, and the affected
+The incident was active when these reports were published, and the affected
 package list may change. Keep [`packages.csv`](packages.csv) synchronized with
-the latest authoritative incident information before relying on a scan.
+the latest Wiz Research IOC list before relying on a scan.
 
 ## If a match is found
 
@@ -144,7 +149,10 @@ malware-removal or full forensic investigation tool.
 
 ## Source
 
-Incident details and indicators are sourced from Socket Research Team,
+The package and version list is sourced from Wiz Research's
+[`keyv-packages.csv`](https://github.com/wiz-sec-public/wiz-research-iocs/blob/main/reports%2Fkeyv-packages.csv).
+
+Incident details and technical analysis are sourced from Socket Research Team,
 "Popular npm Packages in the keyv and Cacheable Namespaces Compromised in
 Active Supply Chain Attack," published August 4, 2026:
 
