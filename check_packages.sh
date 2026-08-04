@@ -11,8 +11,8 @@ if [[ ! -r "$CSV_FILE" ]]; then
 	exit 2
 fi
 
-if ! command -v npm >/dev/null 2>&1; then
-	printf 'Error: npm is required but was not found in PATH.\n' >&2
+if ! command -v node >/dev/null 2>&1; then
+	printf 'Error: node is required but was not found in PATH.\n' >&2
 	exit 2
 fi
 
@@ -117,15 +117,102 @@ scan_cache() {
 	rm -f "$key_file"
 }
 
-printf 'Checking affected npm packages from %s\n' "$CSV_FILE"
-scan_npm_tree project local "$PWD"
+scan_pnpm_tree() {
+	local location=$1 global_flag=$2 json_file
+	json_file=$(mktemp)
 
-global_prefix=$(npm prefix --global 2>/dev/null || true)
-if [[ -n "$global_prefix" ]]; then
-	scan_npm_tree global global "$global_prefix"
+	if [[ "$global_flag" == "global" ]]; then
+		pnpm list --global --depth Infinity --json >"$json_file" 2>/dev/null || true
+	else
+		pnpm list --depth Infinity --json >"$json_file" 2>/dev/null || true
+	fi
+
+	while IFS=$'\t' read -r package version; do
+		[[ -n "$package" && -n "$version" ]] || continue
+		[[ ${AFFECTED["$package|$version"]+yes} ]] && report "$location" "$package" "$version"
+	done < <(
+		node - "$json_file" <<'NODE'
+const fs = require('fs');
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+} catch {
+  process.exit(0);
+}
+
+const seen = new Set();
+function walk(node) {
+  if (!node || typeof node !== 'object') return;
+  for (const [name, dependency] of Object.entries(node.dependencies || {})) {
+    if (dependency.version) {
+      const key = `${name}|${dependency.version}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        process.stdout.write(`${name}\t${dependency.version}\n`);
+      }
+    }
+    walk(dependency);
+  }
+}
+for (const root of (Array.isArray(data) ? data : [data])) walk(root);
+NODE
+	)
+	rm -f "$json_file"
+}
+
+scan_yarn_cache() {
+	local cache_dir package version safe_package entry key
+	cache_dir=$(yarn cache dir 2>/dev/null || true)
+	[[ -d "$cache_dir" ]] || return
+
+	while IFS= read -r -d '' entry; do
+		for key in "${!AFFECTED[@]}"; do
+			IFS='|' read -r package version <<< "$key"
+			safe_package=${package//\//-}
+			if [[ "$entry" == *"$safe_package"* && "$entry" == *"$version"* ]]; then
+				report yarn-cache "$package" "$version"
+			fi
+		done
+	done < <(find "$cache_dir" -type f -print0 2>/dev/null)
+}
+
+scan_pnpm_store() {
+	local store_dir package version key metadata
+	store_dir=$(pnpm store path 2>/dev/null || true)
+	[[ -d "$store_dir" ]] || return
+
+	while IFS= read -r -d '' metadata; do
+		for key in "${!AFFECTED[@]}"; do
+			IFS='|' read -r package version <<< "$key"
+			if grep -Fq '"name":"'"$package"'"' "$metadata" 2>/dev/null \
+				&& grep -Fq '"version":"'"$version"'"' "$metadata" 2>/dev/null; then
+				report pnpm-store "$package" "$version"
+			fi
+		done
+	done < <(find "$store_dir" -type f -name '*.json' -print0 2>/dev/null)
+}
+
+printf 'Checking affected npm packages from %s\n' "$CSV_FILE"
+if command -v npm >/dev/null 2>&1; then
+	scan_npm_tree project local "$PWD"
+
+	global_prefix=$(npm prefix --global 2>/dev/null || true)
+	if [[ -n "$global_prefix" ]]; then
+		scan_npm_tree global global "$global_prefix"
+	fi
+
+	scan_cache
 fi
 
-scan_cache
+if command -v pnpm >/dev/null 2>&1; then
+	scan_pnpm_tree pnpm-project local
+	scan_pnpm_tree pnpm-global global
+	scan_pnpm_store
+fi
+
+if command -v yarn >/dev/null 2>&1; then
+	scan_yarn_cache
+fi
 
 if ((matches == 0)); then
 	printf 'No affected packages found.\n'
