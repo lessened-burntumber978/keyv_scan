@@ -67,10 +67,19 @@ The scanner checks exact package name and version pairs from `packages.csv`.
 - Yarn Classic's cache
 - Yarn Berry's configured cache directory
 - The current project's `.yarn/cache` directory
+- Lockfiles in the current project: `package-lock.json`, `npm-shrinkwrap.json`,
+  `pnpm-lock.yaml`, and `yarn.lock`
 
 The current project is determined by the directory from which the script is
 run. Run it from each project directory that needs checking. The script does
-not search the entire filesystem or inspect lockfiles directly.
+not search the entire filesystem.
+
+Lockfiles are scanned because they pin exact versions whether or not anything
+is installed. A checkout that has never run an install has nothing on disk to
+find, but resolves to the affected release the next time it does. This matters
+most on CI runners and freshly cloned repositories. Lockfiles vendored inside
+`node_modules` are skipped: they describe a dependency's own development tree
+rather than what this project installs.
 
 Package-manager checks are optional. If npm, pnpm, or Yarn is not installed,
 that manager's checks are skipped. Node.js is required because the script uses
@@ -91,11 +100,14 @@ Findings identify the source where a matching version was found:
 ```text
 FOUND  installed project            keyv@6.0.0
 FOUND  cached    pnpm-store         @cacheable/net@2.1.1
+FOUND  pinned    project-lockfiles  keyv@6.0.0
 ```
 
 `installed` means package metadata was found in an installed dependency tree.
 `cached` means an affected artifact remains in a package-manager cache or
 store; it does not prove that its install lifecycle scripts executed.
+`pinned` means a lockfile resolves to an affected version; the package may
+never have been installed, but an install from this lockfile would fetch it.
 
 Exit codes:
 
@@ -129,6 +141,11 @@ the latest Wiz Research IOC list before relying on a scan.
 Treat a matching installation as a potential compromise, especially if npm
 install scripts ran on the machine or CI runner.
 
+A `pinned` finding with no matching `installed` or `cached` entry is different:
+the affected version was never fetched on this machine, so the steps below do
+not apply. Update the lockfile off the affected version before installing from
+it again, and check any CI runner that may already have installed it.
+
 1. Stop using the affected machine or runner for sensitive work and preserve relevant evidence.
 2. Do not assume that deleting `node_modules` alone is sufficient.
 3. Check for the reported loader and payload, including `setup.mjs`, `Math_Symbol.js`, `math_init.js`, and `bun-dl-*` temporary directories.
@@ -144,8 +161,12 @@ malware-removal or full forensic investigation tool.
 ## Files
 
 - [`check_packages.sh`](check_packages.sh): Bash scanner
-- [`package_inventory.js`](package_inventory.js): exact package metadata and cache scanner
+- [`package_inventory.js`](package_inventory.js): exact package metadata, cache, and lockfile scanner
 - [`packages.csv`](packages.csv): package names and affected exact versions
+- [`test_lockfiles.sh`](test_lockfiles.sh): fixture tests for the lockfile parsers
+
+Run the tests with `./test_lockfiles.sh`. They use their own fixture package
+list, so they neither depend on nor validate the live `packages.csv`.
 
 ## Source
 
