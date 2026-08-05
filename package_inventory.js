@@ -185,7 +185,7 @@ function inspectMetadata(value, seen = new Set()) {
   for (const child of Object.values(value)) inspectMetadata(child, seen);
 }
 
-function walkFiles(directory, visitor) {
+function walkFiles(directory, visitor, skipDirectory) {
   const root = realDirectory(directory);
   if (!root) return;
 
@@ -206,8 +206,9 @@ function walkFiles(directory, visitor) {
 
     for (const entry of entries) {
       const entryPath = path.join(realPath, entry.name);
-      if (entry.isDirectory() || entry.isSymbolicLink()) stack.push(entryPath);
-      else visitor(entryPath, entry.name);
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        if (!skipDirectory || !skipDirectory(entry.name)) stack.push(entryPath);
+      } else visitor(entryPath, entry.name);
     }
   }
 }
@@ -245,6 +246,107 @@ function scanYarnCache(directory) {
   });
 }
 
+// Lockfiles pin exact versions, so an affected release can be recorded in a
+// project that has not installed its dependencies yet. Nothing is present on
+// disk to find, but the next install resolves to the affected version.
+function scanNpmLockfile(file) {
+  const lockfile = readJson(file);
+  if (!lockfile) return;
+
+  // lockfileVersion 2 and 3 key every package by its install path.
+  for (const [installPath, meta] of Object.entries(lockfile.packages || {})) {
+    if (!meta || typeof meta !== 'object' || typeof meta.version !== 'string') continue;
+    const marker = 'node_modules/';
+    const index = installPath.lastIndexOf(marker);
+    const name = meta.name || (index === -1 ? '' : installPath.slice(index + marker.length));
+    record(name, meta.version);
+  }
+
+  // lockfileVersion 1 nests dependencies instead.
+  (function walkDependencies(dependencies) {
+    for (const [name, meta] of Object.entries(dependencies || {})) {
+      if (!meta || typeof meta !== 'object') continue;
+      record(name, meta.version);
+      walkDependencies(meta.dependencies);
+    }
+  })(lockfile.dependencies);
+}
+
+// Accepts every pnpm and Yarn Berry descriptor shape seen in the wild:
+// name@1.2.3, @scope/name@1.2.3, /name/1.2.3, /@scope/name/1.2.3, and any of
+// those carrying a (peer@1.0.0) suffix or an npm: protocol prefix.
+function parseDescriptor(descriptor) {
+  let token = descriptor.trim().replace(/\(.*$/, '');
+  if (token.startsWith('/')) token = token.slice(1);
+  token = token.replace(/@npm(?::|%3A)/i, '@');
+
+  const at = token.lastIndexOf('@');
+  if (at > 0) {
+    const version = token.slice(at + 1);
+    if (/^\d/.test(version)) return [token.slice(0, at), version];
+  }
+
+  const slash = token.lastIndexOf('/');
+  if (slash > 0 && /^\d/.test(token.slice(slash + 1))) {
+    return [token.slice(0, slash), token.slice(slash + 1)];
+  }
+
+  return null;
+}
+
+function scanPnpmLockfile(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  // Entry keys are the only indented, colon-terminated lines that carry a
+  // version, across lockfile versions 5 through 9.
+  for (const [, descriptor] of text.matchAll(/^\s{2,}'?([^'\s#][^'\n]*?)'?:\s*$/gm)) {
+    const parsed = parseDescriptor(descriptor);
+    if (parsed) record(parsed[0], parsed[1]);
+  }
+}
+
+function scanYarnLockfile(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  let names = [];
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+
+    // A descriptor header is unindented; one header can list several ranges.
+    if (!/^\s/.test(line) && line.trimEnd().endsWith(':')) {
+      names = line
+        .trimEnd()
+        .slice(0, -1)
+        .split(',')
+        .map((entry) => {
+          const token = entry.trim().replace(/^"|"$/g, '');
+          const at = token.lastIndexOf('@');
+          return at > 0 ? token.slice(0, at) : token;
+        })
+        .filter(Boolean);
+      continue;
+    }
+
+    // Yarn Classic quotes the version, Yarn Berry does not.
+    const match = line.match(/^\s+version:?\s+"?([^"\s]+)"?\s*$/);
+    if (match) for (const name of names) record(name, match[1]);
+  }
+}
+
+function scanLockfiles(directory) {
+  walkFiles(
+    directory,
+    (file, name) => {
+      if (name === 'package-lock.json' || name === 'npm-shrinkwrap.json') scanNpmLockfile(file);
+      else if (name === 'pnpm-lock.yaml') scanPnpmLockfile(file);
+      else if (name === 'yarn.lock') scanYarnLockfile(file);
+    },
+    // Lockfiles vendored inside a dependency describe that dependency's own
+    // development tree, not what this project installs. The installed tree is
+    // already covered by the node-modules mode.
+    (name) => name === 'node_modules' || name === '.git'
+  );
+}
+
 try {
   switch (mode) {
     case 'node-modules':
@@ -261,6 +363,9 @@ try {
       break;
     case 'yarn-cache':
       scanYarnCache(target);
+      break;
+    case 'lockfiles':
+      scanLockfiles(target);
       break;
     default:
       throw new Error(`unknown scan mode: ${mode}`);

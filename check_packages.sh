@@ -94,6 +94,11 @@ printf 'Checking affected npm packages from %s\n' "$CSV_FILE"
 scan_path project installed node-modules "$PWD/node_modules"
 scan_path yarn-unplugged installed package-tree "$PWD/.yarn/unplugged"
 
+# A lockfile pins exact versions whether or not anything is installed yet, so a
+# project can be clean on disk and still resolve to an affected release on its
+# next install.
+scan_path project-lockfiles pinned lockfiles "$PWD"
+
 if command -v npm >/dev/null 2>&1; then
 	manager_count=$((manager_count + 1))
 	scan_command_path "npm global dependencies" npm-global installed node-modules npm root --global
@@ -140,21 +145,23 @@ sort -u "$FINDINGS_FILE" >"$TEMP_DIR/unique-findings.tsv"
 matches=0
 installed_matches=0
 cached_matches=0
+pinned_matches=0
 
 while IFS=$'\t' read -r kind source package version; do
 	[[ -n "$kind" ]] || continue
 	printf 'FOUND  %-9s %-18s %s@%s\n' "$kind" "$source" "$package" "$version"
 	matches=$((matches + 1))
-	if [[ "$kind" == "installed" ]]; then
-		installed_matches=$((installed_matches + 1))
-	else
-		cached_matches=$((cached_matches + 1))
-	fi
+	case "$kind" in
+	installed) installed_matches=$((installed_matches + 1)) ;;
+	pinned) pinned_matches=$((pinned_matches + 1)) ;;
+	*) cached_matches=$((cached_matches + 1)) ;;
+	esac
 done <"$TEMP_DIR/unique-findings.tsv"
 
 if ((matches > 0)); then
-	printf '%d installed and %d cached affected package entr%s found.\n' \
-		"$installed_matches" "$cached_matches" "$([[ $matches -eq 1 ]] && printf y || printf ies)"
+	printf '%d installed, %d cached, and %d pinned affected package entr%s found.\n' \
+		"$installed_matches" "$cached_matches" "$pinned_matches" \
+		"$([[ $matches -eq 1 ]] && printf y || printf ies)"
 fi
 
 if ((scan_failures > 0)); then
